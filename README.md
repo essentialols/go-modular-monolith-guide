@@ -1,4 +1,27 @@
-# Go Modular Monolith Architecture: Patterns, Pitfalls, and Real-World Structures
+<div align="center">
+
+# Go Modular Monolith Architecture
+### A Community-Driven Guide
+
+[![Community Data](https://img.shields.io/badge/community_reports-31-blue)]()
+[![Data Points](https://img.shields.io/badge/data_points-7-green)]()
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+</div>
+
+## Table of Contents
+
+- [About This Guide](#about-this-guide)
+- [Introduction: The Go Modular Monolith Challenge](#introduction-the-go-modular-monolith-challenge)
+- [Core Principles for Go Modular Monoliths](#core-principles-for-go-modular-monoliths)
+- [Do's and Don'ts: Practical Guidance](#dos-and-donts-practical-guidance)
+- [Common Mistakes and Fixes](#common-mistakes-and-fixes)
+- [Real-World Patterns for Go Modular Monoliths](#realworld-patterns-for-go-modular-monoliths)
+- [Checklist for Reviewing Your Go Modular Monolith](#checklist-for-reviewing-your-go-modular-monolith)
+- [Contributing](#contributing)
+
+---
+
 
 ## About This Guide
 
