@@ -360,3 +360,13 @@ Use this checklist to evaluate your current or planned modular monolith structur
 Found an error or have better benchmarks? PRs welcome! This guide improves with community input.
 
 Originally inspired by [this discussion](https://reddit.com/r/golang/comments/1tftqpj/).
+
+
+---
+
+## Related Guides
+
+- [48GB VRAM LLM Playbook](https://github.com/essentialols/48gb-vram-llm-guide) - Model selection, configs, and benchmarks for 48GB setups
+- [DevOps to Platform Engineering Guide](https://github.com/essentialols/devops-platform-engineering-guide) - Career transition paths and upskilling roadmaps  
+- [Go Modular Monolith Guide](https://github.com/essentialols/go-modular-monolith-guide) - Architecture patterns for large Go codebases
+
