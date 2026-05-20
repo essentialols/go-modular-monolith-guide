@@ -238,3 +238,21 @@ my-monolith/
 ├── internal/                     # Private application and library code. Cannot be imported by projects outside the monolith.
 │   ├── auth/                     # Bounded context for Authentication and Authorization
 │   │   ├── domain/               # Core entities, value
+
+---
+
+## Sources and Links
+
+**Primary source:** [How do you structure and maintain large Go modular monoliths](https://reddit.com/r/golang/comments/1tftqpj/) (Reddit thread)
+
+**Official documentation:**
+
+- [Go Project Layout](https://github.com/golang-standards/project-layout)
+- [Google Wire (DI)](https://github.com/google/wire)
+- [Effective Go](https://go.dev/doc/effective_go)
+
+**Methodology:** Community comments were scraped and classified by type. Upvote counts are noted but do not constitute independent verification. All community claims are flagged as unverified.
+
+## License
+
+MIT
