@@ -4,11 +4,11 @@ I navigate the complexities of structuring large Go applications, because a well
 
 My experience suggests that the foundation of a robust Go modular monolith lies in a set of principles that lean into Go's strengths while addressing the inherent challenges of scale. I consistently find that these principles, when applied thoughtfully, prevent premature complexity and foster sustainable growth.
 
-First, **embrace Go's philosophy of explicit, minimal abstraction.** Go is not a language where I expect to follow complex architectural patterns to a tee. Instead, it thrives when I adopt abstractions very sparingly (user comment, 5 upvotes, not independently verified) ([source](https://reddit.com/r/golang/comments/1tftqpj/)). This means resisting the urge to introduce interfaces, layers, or generic solutions until a real, recurring problem necessitates it. My preference is always for clear, direct code over elegant-but-unnecessary indirection.
+First, **embrace Go's philosophy of explicit, minimal abstraction.** Go is not a language where I expect to follow complex architectural patterns to a tee. Instead, it thrives when I adopt abstractions very sparingly (user comment, 5 upvotes, not independently verified) [1]. This means resisting the urge to introduce interfaces, layers, or generic solutions until a real, recurring problem necessitates it. My preference is always for clear, direct code over elegant-but-unnecessary indirection.
 
-Second, **prioritize domain modeling over technical layering.** Many of the problems I encounter, such as "transaction management across modules" or "figuring out where code should live," often stem not from Go itself, but from insufficient time spent on proper domain exploration and bounded context design (user comment, 2 upvotes, not independently verified) ([source](https://reddit.com/r/golang/comments/1tftqpj/)). Swapping Go for another language won't fix a fuzzy understanding of the business problem. I concentrate on identifying distinct business capabilities and their boundaries first.
+Second, **prioritize domain modeling over technical layering.** Many of the problems I encounter, such as "transaction management across modules" or "figuring out where code should live," often stem not from Go itself, but from insufficient time spent on proper domain exploration and bounded context design (user comment, 2 upvotes, not independently verified) [2]. Swapping Go for another language won't fix a fuzzy understanding of the business problem. I concentrate on identifying distinct business capabilities and their boundaries first.
 
-Third, **start simple and allow modularity to emerge organically.** This is perhaps the most critical principle. I've learned the hard way that breaking things down into too many modules too soon often leads to a tangled mess where the initial architectural assumptions no longer align with the application's evolved needs (user comment, 16 upvotes, not independently verified) ([source](https://reddit.com/r/golang/comments/1tftqpj/)). My approach is to "just write the code and see what makes sense to abstract or DRY" (user comment, not independently verified) ([source](https://reddit.com/r/golang/comments/1tftqpj/)). A modular monolith should grow into its structure, not be forced into one from day one. I view modules as solutions to real problems, not as aesthetic choices (user comment, 3 upvotes, not independently verified) ([source](https://reddit.com/r/golang/comments/1tftqpj/)).
+Third, **start simple and allow modularity to emerge organically.** This is perhaps the most critical principle. I've learned the hard way that breaking things down into too many modules too soon often leads to a tangled mess where the initial architectural assumptions no longer align with the application's evolved needs (user comment, 16 upvotes, not independently verified) [3]. My approach is to "just write the code and see what makes sense to abstract or DRY" (user comment, not independently verified) [4]. A modular monolith should grow into its structure, not be forced into one from day one. I view modules as solutions to real problems, not as aesthetic choices (user comment, 3 upvotes, not independently verified) [5].
 
 Fourth, **recognize and strategically manage coupling.** While "loose coupling" is a common mantra, some things *should* be coupled. If I need a set of changes to happen within a single transaction, those components are inherently coupled by that transactional boundary. Identifying these natural coupling points helps me design modules that truly cohere. I don't try to decouple things that logically belong together and change synchronously.
 
@@ -147,24 +147,24 @@ my-monolith/
 Here, `cmd/api/main.go` can import `internal/user` and `internal/order`. `internal/order` can import `internal/common/logger`. However, `internal/order/service.go` cannot directly import `internal/user/repository.go`—it must interact with `internal/user` via its `service.go` or an explicit API interface. This simple rule dramatically improves modularity.
 
 **3. Do Invest in Domain Modeling and Bounded Contexts**
-As highlighted by the community (user comment, 2 upvotes, not independently verified) ([source](https://reddit.com/r/golang/comments/1tftqpj/)), the biggest structural problems often point to a lack of proper domain understanding. I dedicate significant time to collaboratively mapping out the business domain, identifying its core concepts, their relationships, and where natural boundaries occur. This informs my module structure far more effectively than any technical pattern.
+As highlighted by the community (user comment, 2 upvotes, not independently verified) [6], the biggest structural problems often point to a lack of proper domain understanding. I dedicate significant time to collaboratively mapping out the business domain, identifying its core concepts, their relationships, and where natural boundaries occur. This informs my module structure far more effectively than any technical pattern.
 
 ### Don'ts
 
 **1. Don't Over-Modularize Prematurely**
-This is a trap I've fallen into myself. Starting with too many modules, expecting them to evolve neatly, often leads to refactoring headaches. "My first thought was you broke things down into too many modules too soon" (user comment, 16 upvotes, not independently verified) ([source](https://reddit.com/r/golang/comments/1tftqpj/)). I find it's easier to split a cohesive module later than to merge scattered logic.
+This is a trap I've fallen into myself. Starting with too many modules, expecting them to evolve neatly, often leads to refactoring headaches. "My first thought was you broke things down into too many modules too soon" (user comment, 16 upvotes, not independently verified) [7]. I find it's easier to split a cohesive module later than to merge scattered logic.
 
 **Example:**
 Initially, don't create separate `internal/authentication`, `internal/authorization`, `internal/user-profile` modules. Start with a single `internal/user` module that handles all user-related concerns. Only split it if `internal/authentication` needs to be used by many other services *without* the baggage of user profiles, or if the `user` module itself becomes overwhelmingly complex.
 
 **2. Don't Over-Abstract for Abstraction's Sake**
-Go's strength is its simplicity and explicitness. Introducing interfaces for every single type, or creating complex layers (e.g., a "service layer" that just calls a "repository layer" with no added logic) without a clear benefit, adds cognitive load and boilerplate without delivering real value. "Go is a language in which you need to adopt abstractions very sparingly" (user comment, 5 upvotes, not independently verified) ([source](https://reddit.com/r/golang/comments/1tftqpj/)).
+Go's strength is its simplicity and explicitness. Introducing interfaces for every single type, or creating complex layers (e.g., a "service layer" that just calls a "repository layer" with no added logic) without a clear benefit, adds cognitive load and boilerplate without delivering real value. "Go is a language in which you need to adopt abstractions very sparingly" (user comment, 5 upvotes, not independently verified) [8].
 
 **Example:**
 If `MyService` only ever has one implementation, I usually don't define a `MyService` interface just because "it's good practice." I'll use the concrete type. An interface becomes valuable when there are multiple implementations (e.g., mock for testing, different database backends), or when I need to define a contract for dependency inversion across module boundaries.
 
 **3. Don't Introduce a Network Layer Between Internal Packages**
-I've seen attempts to enforce module boundaries by making inter-module communication go over HTTP or gRPC within the *same monolith process*. This adds unnecessary overhead (serialization, deserialization, network latency, even if local), complexity, and points to a misunderstanding of what a modular monolith is. "how is adding a network layer in between packages will solve their code structuring" (user comment, not independently verified) ([source](https://reddit.com/r/golang/comments/1tftqpj/)). Within a monolith, modules communicate via direct function calls.
+I've seen attempts to enforce module boundaries by making inter-module communication go over HTTP or gRPC within the *same monolith process*. This adds unnecessary overhead (serialization, deserialization, network latency, even if local), complexity, and points to a misunderstanding of what a modular monolith is. "how is adding a network layer in between packages will solve their code structuring" (user comment, not independently verified) [9]. Within a monolith, modules communicate via direct function calls.
 
 **Example:**
 Instead of `internal/order` making an HTTP call to `internal/inventory` (even if it's localhost), `internal/order/service.go` should directly call `inventory.InventoryService.DeductStock()`. The dependency is injected as an interface, allowing for different implementations (including mocking for tests), but the call itself is a local function call.
@@ -206,12 +206,12 @@ Through numerous projects, I've identified recurring pitfalls in Go modular mono
 **1. Mistake: Premature Modularization and Over-Abstraction**
 As discussed, the most common trap is creating module boundaries or abstracting interfaces before the problem space is fully understood. This often results in modules that don't align with business domains, or interfaces that restrict future changes rather than enabling them. It's often driven by an eagerness to apply "best practices" from other ecosystems.
 
-*   **Fix:** **Delay architectural decisions until absolutely necessary.** I prefer to start with a relatively flat package structure, grouping related code by feature or domain, rather than by technical layers (e.g., `user/service.go`, `user/repository.go`, `order/service.go`). I extract modules only when a clear, distinct bounded context emerges, when a package becomes too large to manage, or when teams need stricter ownership boundaries. The community consensus is strong here: "just write the code and see what makes sense to abstract or DRY" (user comment, not independently verified) ([source](https://reddit.com/r/golang/comments/1tftqpj/)).
+*   **Fix:** **Delay architectural decisions until absolutely necessary.** I prefer to start with a relatively flat package structure, grouping related code by feature or domain, rather than by technical layers (e.g., `user/service.go`, `user/repository.go`, `order/service.go`). I extract modules only when a clear, distinct bounded context emerges, when a package becomes too large to manage, or when teams need stricter ownership boundaries. The community consensus is strong here: "just write the code and see what makes sense to abstract or DRY" (user comment, not independently verified) [10].
 
 **2. Mistake: Ignoring Domain Modeling and Bounded Contexts**
 Treating a modular monolith purely as a technical exercise in directory organization, without deep consideration for the business domain, inevitably leads to "anemic" modules or modules that cut across logical boundaries. This results in unclear responsibilities and difficulties in managing cross-module transactions.
 
-*   **Fix:** **Invest heavily in domain exploration.** Before writing much code, I engage with domain experts to understand the core business processes, entities, and events. I identify natural bounded contexts (e.g., "User Management" vs. "Order Fulfillment" vs. "Payment Processing"). These contexts become the guiding force for my module boundaries, ensuring they are aligned with the business rather than arbitrary technical concerns. "the problem is not Go, but that you are not spending enough time to properly do domain modeling/exploration and bounded context design" (user comment, 2 upvotes, not independently verified) ([source](https://reddit.com/r/golang/comments/1tftqpj/)).
+*   **Fix:** **Invest heavily in domain exploration.** Before writing much code, I engage with domain experts to understand the core business processes, entities, and events. I identify natural bounded contexts (e.g., "User Management" vs. "Order Fulfillment" vs. "Payment Processing"). These contexts become the guiding force for my module boundaries, ensuring they are aligned with the business rather than arbitrary technical concerns. "the problem is not Go, but that you are not spending enough time to properly do domain modeling/exploration and bounded context design" (user comment, 2 upvotes, not independently verified) [10].
 
 **3. Mistake: Leaky Abstractions and Indirect Dependencies**
 When modules have implicit knowledge of each other's internal structures, or communicate through mechanisms that are not explicitly defined (e.g., direct database access from another module, or relying on global state), it creates "leaky" abstractions. This makes refactoring difficult and introduces hidden coupling.
@@ -228,7 +228,7 @@ While not strictly a modular monolith issue, in Go, I often see developers strug
 My preferred structure for a Go modular monolith often converges on a blend of the standard Go project layout and the principles of domain-driven design, utilizing `internal` packages to define clear boundaries. I aim for a structure that is easy to navigate for new developers while providing strong guarantees about module independence.
 
 **1. Standard Go Project Layout as a Foundation**
-I typically start with a layout similar to what `golang-standards/project-layout` suggests ([source](https://reddit.com/r/golang/comments/1tftqpj/)), then adapt it for modularity.
+I typically start with a layout similar to what `golang-standards/project-layout` suggests [10], then adapt it for modularity.
 
 ```
 my-monolith/
@@ -241,17 +241,28 @@ my-monolith/
 
 ---
 
-## Sources and Links
+## Sources
 
-**Primary source:** [How do you structure and maintain large Go modular monoliths](https://reddit.com/r/golang/comments/1tftqpj/) (Reddit thread)
+**Primary source:** [Go Modular Monolith Guide](https://reddit.com/r/golang/comments/1tftqpj/) (Reddit thread)
 
 **Official documentation:**
 
 - [Go Project Layout](https://github.com/golang-standards/project-layout)
-- [Google Wire (DI)](https://github.com/google/wire)
+- [Google Wire](https://github.com/google/wire)
 - [Effective Go](https://go.dev/doc/effective_go)
 
-**Methodology:** Community comments were scraped and classified by type. Upvote counts are noted but do not constitute independent verification. All community claims are flagged as unverified.
+**Note:** Inline references like [1], [2] link to the primary Reddit thread. Upvote counts reflect time of collection, not independent verification.
+
+[1]: https://reddit.com/r/golang/comments/1tftqpj/
+[2]: https://reddit.com/r/golang/comments/1tftqpj/
+[3]: https://reddit.com/r/golang/comments/1tftqpj/
+[4]: https://reddit.com/r/golang/comments/1tftqpj/
+[5]: https://reddit.com/r/golang/comments/1tftqpj/
+[6]: https://reddit.com/r/golang/comments/1tftqpj/
+[7]: https://reddit.com/r/golang/comments/1tftqpj/
+[8]: https://reddit.com/r/golang/comments/1tftqpj/
+[9]: https://reddit.com/r/golang/comments/1tftqpj/
+[10]: https://reddit.com/r/golang/comments/1tftqpj/
 
 ## License
 
