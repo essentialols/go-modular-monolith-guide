@@ -1,0 +1,475 @@
+name: ChromeML Stage 2 model load
+
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stage2:
+    name: Stage 2 — official v3Nano model load
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - name: Disk and host info
+        shell: bash
+        run: |
+          set -euxo pipefail
+          uname -a
+          sw_vers
+          sysctl -n hw.memsize
+          df -h /
+
+      - name: Download current ChromeML runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl --fail --location --retry 3 \
+            'https://dl.google.com/chrome/mac/universal/stable/GGRO/googlechrome.dmg' \
+            --output /tmp/googlechrome.dmg
+          hdiutil attach -nobrowse -readonly /tmp/googlechrome.dmg -mountpoint /tmp/chrome-dmg
+          LIB="$(find '/tmp/chrome-dmg/Google Chrome.app' -name liboptimization_guide_internal.dylib -print -quit)"
+          test -n "$LIB"
+          cp "$LIB" /tmp/liboptimization_guide_internal.dylib
+          '/tmp/chrome-dmg/Google Chrome.app/Contents/MacOS/Google Chrome' --version || true
+          shasum -a 256 /tmp/liboptimization_guide_internal.dylib
+          hdiutil detach /tmp/chrome-dmg
+          rm -f /tmp/googlechrome.dmg
+          df -h /
+
+      - name: Restore exact Chrome 152 Dawn build
+        uses: actions/cache@v4
+        with:
+          path: /tmp/dawn-install
+          key: chromeml-dawn-571752c9cb3ed36a3194854374984427794c4dda-macos15-arm64-v1
+          fail-on-cache-miss: true
+
+      - name: Extract official v3Nano files by HTTP byte range
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/nano
+          python3 - <<'PY'
+          import json, os, struct, urllib.request, zlib
+
+          URL = 'https://dl.google.com/release2/chrome_component/ac3uxiyzyouxrt63gkhye6luadna_2025.8.8.1141/fklghjjljmnfjoepjmlobpekiapffcja_2025.8.8.1141_all_ac2d3dn5lvjgqup4kcliqlhbxo3a.crx3'
+          TOTAL = 4269937721
+          EXPECTED_CRX_SHA256 = '882fb2e911f13e972e397ab2b8c7b3f78c0d767b7954d96a0efb61e62a09585e'
+
+          def open_range(start, end):
+              req = urllib.request.Request(
+                  URL,
+                  headers={
+                      'Range': f'bytes={start}-{end}',
+                      'User-Agent': 'Mozilla/5.0 Chrome/152.0.7977.65',
+                      'Accept-Encoding': 'identity',
+                  })
+              r = urllib.request.urlopen(req, timeout=120)
+              cr = r.headers.get('Content-Range')
+              if r.status != 206 or not cr:
+                  r.close()
+                  raise RuntimeError(f'range request not honored: status={r.status} content-range={cr!r}')
+              return r
+
+          def fetch_range(start, end):
+              with open_range(start, end) as r:
+                  expected = end - start + 1
+                  data = r.read(expected + 1)
+                  if len(data) != expected:
+                      raise RuntimeError(f'range length mismatch {start}-{end}: {len(data)} != {expected}')
+                  return data
+
+          head = fetch_range(0, 65535)
+          if head[:4] != b'Cr24':
+              raise RuntimeError(f'bad CRX magic {head[:4]!r}')
+          version, header_size = struct.unpack_from('<II', head, 4)
+          if version != 3:
+              raise RuntimeError(f'CRX version {version}, wanted 3')
+          zip_start = 12 + header_size
+          print('CRX_VERSION', version)
+          print('CRX_HEADER_SIZE', header_size)
+          print('ZIP_START', zip_start)
+          print('OFFICIAL_CRX_SHA256_FROM_GOOGLE_UPDATE_METADATA', EXPECTED_CRX_SHA256)
+
+          tail_size = 4 * 1024 * 1024
+          tail_start = TOTAL - tail_size
+          tail = fetch_range(tail_start, TOTAL - 1)
+          eocd_pos = tail.rfind(b'PK\x05\x06')
+          if eocd_pos < 0:
+              raise RuntimeError('EOCD not found')
+          fields = struct.unpack_from('<4s4H2LH', tail, eocd_pos)
+          total_entries = fields[4]
+          cd_size = fields[5]
+          cd_off = fields[6]
+
+          if total_entries == 0xffff or cd_size == 0xffffffff or cd_off == 0xffffffff:
+              loc_pos = tail.rfind(b'PK\x06\x07', 0, eocd_pos)
+              if loc_pos < 0:
+                  raise RuntimeError('Zip64 locator missing')
+              _, _, z64_off, _ = struct.unpack_from('<4sLQL', tail, loc_pos)
+              z64_abs = zip_start + z64_off
+              if tail_start <= z64_abs < TOTAL:
+                  z64 = tail[z64_abs-tail_start:]
+              else:
+                  z64 = fetch_range(z64_abs, min(TOTAL - 1, z64_abs + 4095))
+              vals = struct.unpack_from('<4sQ2H2L4Q', z64, 0)
+              if vals[0] != b'PK\x06\x06':
+                  raise RuntimeError('bad Zip64 EOCD')
+              total_entries, cd_size, cd_off = vals[7], vals[8], vals[9]
+
+          cd_abs = zip_start + cd_off
+          cd_end = cd_abs + cd_size - 1
+          if cd_size > 64 * 1024 * 1024:
+              raise RuntimeError(f'implausible central directory size {cd_size}')
+          if tail_start <= cd_abs and cd_end < TOTAL:
+              cd = tail[cd_abs-tail_start:cd_end-tail_start+1]
+          else:
+              cd = fetch_range(cd_abs, cd_end)
+
+          entries = []
+          p = 0
+          while p + 46 <= len(cd):
+              vals = struct.unpack_from('<4s6H3L5H2L', cd, p)
+              if vals[0] != b'PK\x01\x02':
+                  raise RuntimeError(f'bad central directory signature at {p}')
+              method = vals[4]
+              crc32 = vals[7]
+              comp32, uncomp32 = vals[8], vals[9]
+              name_len, extra_len, comment_len = vals[10], vals[11], vals[12]
+              local32 = vals[16]
+              name = cd[p+46:p+46+name_len].decode('utf-8', 'replace')
+              extra = cd[p+46+name_len:p+46+name_len+extra_len]
+              comp, uncomp, local = comp32, uncomp32, local32
+              q = 0
+              while q + 4 <= len(extra):
+                  tag, sz = struct.unpack_from('<HH', extra, q)
+                  body = extra[q+4:q+4+sz]
+                  if tag == 1:
+                      r = 0
+                      if uncomp32 == 0xffffffff:
+                          uncomp = struct.unpack_from('<Q', body, r)[0]; r += 8
+                      if comp32 == 0xffffffff:
+                          comp = struct.unpack_from('<Q', body, r)[0]; r += 8
+                      if local32 == 0xffffffff:
+                          local = struct.unpack_from('<Q', body, r)[0]; r += 8
+                      break
+                  q += 4 + sz
+              entries.append(dict(name=name, method=method, crc32=crc32,
+                                  compressed=comp, uncompressed=uncomp,
+                                  local_off=local))
+              p += 46 + name_len + extra_len + comment_len
+
+          print('ENTRY_COUNT', len(entries))
+          for e in entries:
+              print('ENTRY', json.dumps(e, sort_keys=True))
+
+          by_basename = {os.path.basename(e['name']): e for e in entries}
+          wanted = ['manifest.json', 'on_device_model_execution_config.pb', 'weights.bin']
+          for name in wanted:
+              if name not in by_basename:
+                  raise RuntimeError(f'{name} missing from official package')
+
+          def payload_span(e):
+              local_abs = zip_start + e['local_off']
+              hdr = fetch_range(local_abs, local_abs + 65535)
+              if hdr[:4] != b'PK\x03\x04':
+                  raise RuntimeError(f'bad local header for {e["name"]}')
+              name_len, extra_len = struct.unpack_from('<HH', hdr, 26)
+              data_abs = local_abs + 30 + name_len + extra_len
+              return data_abs, data_abs + e['compressed'] - 1
+
+          def extract_entry(e, dest):
+              start, end = payload_span(e)
+              print('EXTRACT_BEGIN', e['name'], 'method', e['method'],
+                    'compressed', e['compressed'], 'uncompressed', e['uncompressed'],
+                    'range', start, end)
+              crc = 0
+              out_n = 0
+              decomp = zlib.decompressobj(-15) if e['method'] == 8 else None
+              if e['method'] not in (0, 8):
+                  raise RuntimeError(f'unsupported ZIP compression method {e["method"]}')
+              with open_range(start, end) as r, open(dest, 'wb') as out:
+                  remaining = e['compressed']
+                  while remaining:
+                      chunk = r.read(min(8 * 1024 * 1024, remaining))
+                      if not chunk:
+                          raise RuntimeError(f'unexpected EOF extracting {e["name"]}')
+                      remaining -= len(chunk)
+                      raw = decomp.decompress(chunk) if decomp else chunk
+                      if raw:
+                          out.write(raw)
+                          out_n += len(raw)
+                          crc = zlib.crc32(raw, crc)
+                  if decomp:
+                      raw = decomp.flush()
+                      if raw:
+                          out.write(raw)
+                          out_n += len(raw)
+                          crc = zlib.crc32(raw, crc)
+              crc &= 0xffffffff
+              if out_n != e['uncompressed']:
+                  raise RuntimeError(f'uncompressed size mismatch for {e["name"]}: {out_n} != {e["uncompressed"]}')
+              if crc != e['crc32']:
+                  raise RuntimeError(f'CRC mismatch for {e["name"]}: {crc:08x} != {e["crc32"]:08x}')
+              print('EXTRACT_PASS', e['name'], 'bytes', out_n, 'crc32', f'{crc:08x}')
+
+          for name in wanted:
+              extract_entry(by_basename[name], f'/tmp/nano/{name}')
+
+          manifest = json.load(open('/tmp/nano/manifest.json'))
+          print('MANIFEST', json.dumps(manifest, sort_keys=True))
+          spec = manifest.get('BaseModelSpec', {})
+          if manifest.get('version') != '2025.8.8.1141' or spec.get('name') != 'v3Nano':
+              raise RuntimeError(f'unexpected model manifest: {manifest}')
+          print('MODEL_PACKAGE_PASS v3Nano 2025.8.8.1141')
+          PY
+          ls -lah /tmp/nano
+          df -h /
+
+      - name: Build exact Chrome 152 model-load probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/chromeml-stage2
+          cat >/tmp/chromeml-stage2/main.cpp <<'EOF'
+          #include <dlfcn.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+
+          #include <cerrno>
+          #include <cstddef>
+          #include <cstdint>
+          #include <cstdio>
+          #include <cstring>
+          #include <functional>
+          #include <optional>
+          #include <utility>
+
+          #include <dawn/dawn_proc_table.h>
+          #include <dawn/native/DawnNative.h>
+          #include <dawn/webgpu.h>
+
+          namespace ml {
+          enum class ModelPerformanceHint { kHighestQuality, kFastestInference };
+          enum class ModelBackendType { kGpuBackend, kApuBackend, kCpuBackend };
+          }
+
+          using ChromeMLModel = uintptr_t;
+          using PlatformFile = int;
+          using ChromeMLFatalErrorFn = void (*)(const char*);
+          using ChromeMLScheduleFn = void (*)(uintptr_t, std::function<void()>*);
+
+          struct ChromeMLModelData {
+            PlatformFile weights_file = -1;
+            std::optional<uint32_t> file_id;
+            PlatformFile cache_file = -1;
+            PlatformFile encoder_cache_file = -1;
+            PlatformFile adapter_cache_file = -1;
+            PlatformFile program_cache_file = -1;
+            const char* model_path = nullptr;
+            const char* sentencepiece_model_path = nullptr;
+          };
+
+          struct ChromeMLModelDescriptor {
+            ml::ModelBackendType backend_type;
+            const ChromeMLModelData* model_data;
+            uint32_t max_tokens;
+            float temperature;
+            int top_k;
+            const uint32_t* adaptation_ranks;
+            size_t adaptation_ranks_size;
+            bool prefer_texture_weights;
+            bool enable_host_mapped_pointer;
+            bool use_low_power;
+            bool allow_fp16;
+            bool enable_speculative_decoding;
+            ml::ModelPerformanceHint performance_hint;
+            uint64_t vram_mb = 0;
+          };
+
+          struct ChromeMLCapabilities {
+            bool image_input = false;
+            bool audio_input = false;
+          };
+
+          struct ChromeMLPerformanceInfo {
+            float input_speed = 0.0f;
+            float output_speed = 0.0f;
+            bool is_integrated_gpu = false;
+            uint64_t device_heap_size = 0;
+            uint64_t max_buffer_size = 0;
+          };
+
+          struct ChromeMLMetricsFns {
+            void (*RecordExactLinearHistogram)(const char*, int, int);
+            void (*RecordCustomCountsHistogram)(const char*, int, int, int, size_t);
+            void (*RecordMediumTimesHistogram)(const char*, int64_t);
+          };
+
+          using GetChromeMLAPI = void* const* (*)(bool);
+          using TryInitDawnProcsFn = bool (*)(const DawnProcTable&);
+          using SetMetricsFns = void (*)(const ChromeMLMetricsFns*);
+          using SetFatalErrorFn = void (*)(ChromeMLFatalErrorFn);
+          using DestroyModelFn = void (*)(ChromeMLModel);
+          using GetCapabilitiesFn = bool (*)(PlatformFile, ChromeMLCapabilities&);
+          using SessionCreateModelFn = ChromeMLModel (*)(
+              const ChromeMLModelDescriptor*, uintptr_t, ChromeMLScheduleFn);
+
+          static void fatal(const char* msg) {
+            std::fprintf(stderr, "CHROMEML_CALLBACK %s\n", msg ? msg : "(null)");
+            std::fflush(stderr);
+          }
+          static void metric1(const char*, int, int) {}
+          static void metric2(const char*, int, int, int, size_t) {}
+          static void metric3(const char*, int64_t) {}
+
+          static void ScheduleInline(uintptr_t context, std::function<void()>* task) {
+            std::fprintf(stderr, "SCHEDULE context=0x%llx task=%p\n",
+                         static_cast<unsigned long long>(context), task);
+            std::fflush(stderr);
+            if (!task) return;
+            std::function<void()> fn = std::move(*task);
+            if (fn) fn();
+          }
+
+          int main(int argc, char** argv) {
+            if (argc != 4) {
+              std::fprintf(stderr, "usage: %s dylib weights litert(0|1)\n", argv[0]);
+              return 64;
+            }
+            const bool litert = std::atoi(argv[3]) != 0;
+            std::printf("ABI sizeof(optional_u32)=%zu sizeof(model_data)=%zu sizeof(descriptor)=%zu\n",
+                        sizeof(std::optional<uint32_t>), sizeof(ChromeMLModelData),
+                        sizeof(ChromeMLModelDescriptor));
+            std::printf("BACKEND_TABLE litert=%d\n", litert ? 1 : 0);
+
+            void* lib = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+            if (!lib) {
+              std::fprintf(stderr, "STAGE2_FAIL dlopen: %s\n", dlerror());
+              return 1;
+            }
+            auto getter = reinterpret_cast<GetChromeMLAPI>(dlsym(lib, "GetChromeMLAPI"));
+            if (!getter) {
+              std::fprintf(stderr, "STAGE2_FAIL GetChromeMLAPI missing\n");
+              return 2;
+            }
+            void* const* api = getter(litert);
+            if (!api) {
+              std::fprintf(stderr, "STAGE2_FAIL API table null\n");
+              return 3;
+            }
+
+            auto try_init = reinterpret_cast<TryInitDawnProcsFn>(api[1]);
+            auto set_metrics = reinterpret_cast<SetMetricsFns>(api[2]);
+            auto set_fatal_gpu = reinterpret_cast<SetFatalErrorFn>(api[3]);
+            auto destroy_model = reinterpret_cast<DestroyModelFn>(api[4]);
+            auto get_caps = reinterpret_cast<GetCapabilitiesFn>(api[7]);
+            auto set_fatal_nongpu = reinterpret_cast<SetFatalErrorFn>(api[8]);
+            auto create_model = reinterpret_cast<SessionCreateModelFn>(api[9]);
+
+            const DawnProcTable& procs = dawn::native::GetProcs();
+            if (!try_init || !try_init(procs)) {
+              std::fprintf(stderr, "STAGE2_FAIL Dawn proc table rejected\n");
+              return 4;
+            }
+            std::puts("STAGE2_DAWN_PASS");
+
+            const ChromeMLMetricsFns metrics{&metric1, &metric2, &metric3};
+            if (set_metrics) set_metrics(&metrics);
+            if (set_fatal_gpu) set_fatal_gpu(&fatal);
+            if (set_fatal_nongpu) set_fatal_nongpu(&fatal);
+
+            int fd = open(argv[2], O_RDONLY);
+            if (fd < 0) {
+              std::fprintf(stderr, "STAGE2_FAIL open weights: %s\n", std::strerror(errno));
+              return 5;
+            }
+
+            if (get_caps) {
+              int cap_fd = dup(fd);
+              if (cap_fd >= 0) {
+                ChromeMLCapabilities caps;
+                bool ok = get_caps(cap_fd, caps);
+                std::printf("STAGE2_CAPS ok=%d image=%d audio=%d\n",
+                            ok ? 1 : 0, caps.image_input ? 1 : 0,
+                            caps.audio_input ? 1 : 0);
+                // The ChromeML implementation may consume/close this descriptor.
+                // Do not close cap_fd here; it is only a short-lived probe process.
+              }
+            }
+
+            ChromeMLModelData data;
+            data.weights_file = fd;
+
+            ChromeMLModelDescriptor desc{};
+            desc.backend_type = ml::ModelBackendType::kCpuBackend;
+            desc.model_data = &data;
+            desc.max_tokens = 1024;
+            desc.temperature = 0.0f;
+            desc.top_k = 3;
+            desc.adaptation_ranks = nullptr;
+            desc.adaptation_ranks_size = 0;
+            desc.prefer_texture_weights = true;
+            desc.enable_host_mapped_pointer = true;
+            desc.use_low_power = false;
+            desc.allow_fp16 = true;
+            desc.enable_speculative_decoding = false;
+            desc.performance_hint = ml::ModelPerformanceHint::kFastestInference;
+            desc.vram_mb = 0;
+
+            std::puts("STAGE2_CALL SessionCreateModel CPU max_tokens=1024");
+            std::fflush(stdout);
+            ChromeMLModel model = create_model
+                ? create_model(&desc, 0xC0DEC0DEu, &ScheduleInline)
+                : 0;
+            std::printf("STAGE2_MODEL_HANDLE 0x%llx\n",
+                        static_cast<unsigned long long>(model));
+            std::fflush(stdout);
+            if (!model) {
+              std::fprintf(stderr, "STAGE2_MODEL_FAIL litert=%d\n", litert ? 1 : 0);
+              return 6;
+            }
+            std::printf("STAGE2_MODEL_PASS litert=%d\n", litert ? 1 : 0);
+            std::fflush(stdout);
+            if (destroy_model) destroy_model(model);
+            std::puts("STAGE2_DESTROY_PASS");
+            return 0;
+          }
+          EOF
+
+          cat >/tmp/chromeml-stage2/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.20)
+          project(chromeml_stage2 LANGUAGES CXX)
+          set(CMAKE_CXX_STANDARD 20)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          find_package(Threads REQUIRED)
+          find_package(Dawn REQUIRED CONFIG)
+          add_executable(chromeml_stage2 main.cpp)
+          target_link_libraries(chromeml_stage2 PRIVATE dawn::webgpu_dawn)
+          EOF
+
+          cmake -S /tmp/chromeml-stage2 -B /tmp/chromeml-stage2/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH=/tmp/dawn-install
+          cmake --build /tmp/chromeml-stage2/build --parallel 3
+          file /tmp/chromeml-stage2/build/chromeml_stage2
+
+      - name: Stage 2 — load official Nano outside Chrome
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo '=== Chrome 152 default: LiteRT-LM table ==='
+          if /tmp/chromeml-stage2/build/chromeml_stage2 \
+              /tmp/liboptimization_guide_internal.dylib \
+              /tmp/nano/weights.bin 1 2>&1 | tee /tmp/stage2-litert.log; then
+            grep -q 'STAGE2_MODEL_PASS litert=1' /tmp/stage2-litert.log
+            exit 0
+          fi
+          echo '=== LiteRT-LM model load failed; diagnostic legacy-table fallback ==='
+          /tmp/chromeml-stage2/build/chromeml_stage2 \
+              /tmp/liboptimization_guide_internal.dylib \
+              /tmp/nano/weights.bin 0 2>&1 | tee /tmp/stage2-legacy.log
+          grep -q 'STAGE2_MODEL_PASS litert=0' /tmp/stage2-legacy.log

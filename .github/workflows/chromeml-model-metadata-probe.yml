@@ -1,0 +1,114 @@
+name: ChromeML model metadata probe
+
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  model-metadata:
+    name: Official Nano component metadata
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Query official Google component updater for Nano
+        shell: bash
+        run: |
+          set -euxo pipefail
+          APPID='fklghjjljmnfjoepjmlobpekiapffcja'
+          VERSION='152.0.7977.65'
+          SESSION="{$(uuidgen | tr '[:upper:]' '[:lower:]')}"
+          REQUEST="{$(uuidgen | tr '[:upper:]' '[:lower:]')}"
+          OSVER="$(sw_vers -productVersion)"
+          PHYSGIB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+
+          python3 - <<PY >/tmp/request.json
+          import json
+          req = {
+            "request": {
+              "protocol": "4.0",
+              "ismachine": False,
+              "dedup": "cr",
+              "acceptformat": "crx3,download,puff,run,xz,zucc",
+              "sessionid": "${SESSION}",
+              "requestid": "${REQUEST}",
+              "@updater": "chrome",
+              "prodversion": "${VERSION}",
+              "updaterversion": "${VERSION}",
+              "@os": "mac",
+              "arch": "arm64",
+              "hw": {
+                "physmemory": int("${PHYSGIB}"),
+                "sse": False, "sse2": False, "sse3": False,
+                "sse41": False, "sse42": False, "ssse3": False, "avx": False
+              },
+              "os": {"platform": "Mac OS X", "arch": "arm64", "version": "${OSVER}"},
+              "apps": [{
+                "appid": "${APPID}",
+                "version": "0",
+                "installsource": "ondemand",
+                "enabled": True,
+                "cpu_support": "yes",
+                "highest_quality_support": "yes",
+                "fastest_inference_support": "yes",
+                "updatecheck": {}
+              }]
+            }
+          }
+          print(json.dumps(req, separators=(",", ":")))
+          PY
+
+          cat /tmp/request.json
+          curl --fail-with-body --location \
+            -H 'Content-Type: application/json' \
+            -H "X-Goog-Update-Updater: chrome-${VERSION}" \
+            -H 'X-Goog-Update-Interactivity: fg' \
+            -H "X-Goog-Update-AppId: ${APPID}" \
+            --data-binary @/tmp/request.json \
+            'https://update.googleapis.com/service/update2/json' \
+            -o /tmp/response.raw
+
+          python3 - <<'PY'
+          import json, pathlib
+          raw = pathlib.Path('/tmp/response.raw').read_text()
+          print('RAW_PREFIX=', repr(raw[:20]))
+          if raw.startswith(")]}'"):
+              raw = raw.split('\n', 1)[1]
+          obj = json.loads(raw)
+          print(json.dumps(obj, indent=2))
+          response = obj.get('response', obj)
+          apps = response.get('apps') or response.get('app') or []
+          if not apps:
+              raise SystemExit('MODEL_META_FAIL no app response')
+          app = apps[0]
+          uc = app.get('updatecheck', {})
+          status = uc.get('status')
+          print('UPDATE_STATUS=', status)
+          if status != 'ok':
+              raise SystemExit(f'MODEL_META_FAIL update status {status!r}')
+          print('NEXT_VERSION=', uc.get('nextversion') or uc.get('manifest', {}).get('version'))
+          found = []
+          for pipe in uc.get('pipelines', []):
+              for op in pipe.get('operations', []):
+                  for u in op.get('urls', []):
+                      if isinstance(u, dict) and u.get('url'):
+                          found.append((pipe.get('pipeline_id'), op.get('type'), op.get('size'), u['url'], op.get('out') or op.get('in')))
+          # Protocol 3 fallback shape.
+          urls = uc.get('urls', {}).get('url', []) if isinstance(uc.get('urls'), dict) else []
+          manifest = uc.get('manifest', {})
+          packages = manifest.get('packages', {}).get('package', []) if isinstance(manifest.get('packages'), dict) else []
+          for base in urls:
+              baseurl = base.get('codebase') if isinstance(base, dict) else None
+              if baseurl:
+                  for pkg in packages:
+                      if isinstance(pkg, dict) and pkg.get('name'):
+                          found.append(('v3', 'crx3', pkg.get('size'), baseurl + pkg['name'], {'sha256': pkg.get('hash_sha256')}))
+          if not found:
+              raise SystemExit('MODEL_META_FAIL no download URL in response')
+          for item in found:
+              print('MODEL_DOWNLOAD=', item)
+          print('MODEL_META_PASS official component metadata resolved')
+          PY

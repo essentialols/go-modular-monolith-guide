@@ -1,0 +1,209 @@
+name: ChromeML standalone probe
+
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Stage 0/1 — standalone ChromeML runtime
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Download current stable Google Chrome
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl --fail --location --retry 3 \
+            'https://dl.google.com/chrome/mac/universal/stable/GGRO/googlechrome.dmg' \
+            --output /tmp/googlechrome.dmg
+          hdiutil attach -nobrowse -readonly /tmp/googlechrome.dmg -mountpoint /tmp/chrome-dmg
+          LIB="$(find '/tmp/chrome-dmg/Google Chrome.app' -name liboptimization_guide_internal.dylib -print -quit)"
+          test -n "$LIB"
+          cp "$LIB" /tmp/liboptimization_guide_internal.dylib
+          '/tmp/chrome-dmg/Google Chrome.app/Contents/MacOS/Google Chrome' --version || true
+          file /tmp/liboptimization_guide_internal.dylib
+          shasum -a 256 /tmp/liboptimization_guide_internal.dylib
+          otool -L /tmp/liboptimization_guide_internal.dylib
+          nm -gU /tmp/liboptimization_guide_internal.dylib | grep -E 'GetChromeMLAPI|GetPageContextEligibilityAPI'
+
+      - name: Stage 0 — build getter probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat >/tmp/chromeml_stage0.c <<'EOF'
+          #include <dlfcn.h>
+          #include <stdbool.h>
+          #include <stdio.h>
+
+          typedef const void* (*ChromeMLAPIGetter)(bool enable_litert_lm);
+
+          int main(int argc, char** argv) {
+            if (argc != 2) return 64;
+            void* lib = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+            if (!lib) { fprintf(stderr, "STAGE0_FAIL dlopen: %s\n", dlerror()); return 1; }
+            dlerror();
+            ChromeMLAPIGetter getter = (ChromeMLAPIGetter)dlsym(lib, "GetChromeMLAPI");
+            const char* err = dlerror();
+            if (err || !getter) { fprintf(stderr, "STAGE0_FAIL dlsym: %s\n", err ? err : "null"); return 2; }
+            const void* legacy = getter(false);
+            const void* litert = getter(true);
+            printf("legacy_api=%p\nlitert_api=%p\n", legacy, litert);
+            if (!legacy && !litert) return 3;
+            puts("STAGE0_PASS ChromeML loaded and API table returned outside Chrome");
+            dlclose(lib);
+            return 0;
+          }
+          EOF
+          xcrun clang -O2 -Wall -Wextra /tmp/chromeml_stage0.c -o /tmp/chromeml_stage0
+          /tmp/chromeml_stage0 /tmp/liboptimization_guide_internal.dylib
+
+      - name: Restore exact Dawn build
+        id: dawn-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/dawn-install
+          key: chromeml-dawn-571752c9cb3ed36a3194854374984427794c4dda-macos15-arm64-v1
+
+      - name: Fetch exact Chrome 152 Dawn revision
+        if: steps.dawn-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          DAWN_REV=571752c9cb3ed36a3194854374984427794c4dda
+          mkdir /tmp/dawn
+          git -C /tmp/dawn init
+          git -C /tmp/dawn remote add origin https://dawn.googlesource.com/dawn
+          git -C /tmp/dawn fetch --depth 1 origin "$DAWN_REV"
+          git -C /tmp/dawn checkout --detach FETCH_HEAD
+          test "$(git -C /tmp/dawn rev-parse HEAD)" = "$DAWN_REV"
+          cmake --version
+          ninja --version
+
+      - name: Build and install exact Dawn
+        if: steps.dawn-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S /tmp/dawn -B /tmp/dawn-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDAWN_FETCH_DEPENDENCIES=ON \
+            -DDAWN_ENABLE_INSTALL=ON \
+            -DDAWN_BUILD_MONOLITHIC_LIBRARY=STATIC \
+            -DDAWN_BUILD_SAMPLES=OFF \
+            -DDAWN_BUILD_TESTS=OFF \
+            -DTINT_BUILD_TESTS=OFF
+          cmake --build /tmp/dawn-build --target webgpu_dawn --parallel 3
+          cmake --install /tmp/dawn-build --prefix /tmp/dawn-install
+
+      - name: Stage 1 — build exact-Dawn ChromeML initializer
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/chromeml-stage1
+          cat >/tmp/chromeml-stage1/main.cpp <<'EOF'
+          #include <dlfcn.h>
+          #include <cstddef>
+          #include <cstdint>
+          #include <cstdio>
+
+          #include <dawn/dawn_proc_table.h>
+          #include <dawn/native/DawnNative.h>
+
+          struct ChromeMLPerformanceInfo {
+            float input_speed = 0.0f;
+            float output_speed = 0.0f;
+            bool is_integrated_gpu = false;
+            uint64_t device_heap_size = 0;
+            uint64_t max_buffer_size = 0;
+          };
+          static_assert(sizeof(ChromeMLPerformanceInfo) == 32);
+          static_assert(offsetof(ChromeMLPerformanceInfo, device_heap_size) == 16);
+
+          struct ChromeMLMetricsFns {
+            void (*RecordExactLinearHistogram)(const char*, int, int);
+            void (*RecordCustomCountsHistogram)(const char*, int, int, int, size_t);
+            void (*RecordMediumTimesHistogram)(const char*, int64_t);
+          };
+          using FatalFn = void (*)(const char*);
+          using GenericFn = void (*)();
+
+          struct ChromeMLAPIPrefix {
+            void (*InitDawnProcs)(const DawnProcTable&);
+            bool (*TryInitDawnProcs)(const DawnProcTable&);
+            void (*SetMetricsFns)(const ChromeMLMetricsFns*);
+            void (*SetFatalErrorFn)(FatalFn);
+            void (*DestroyModel)(uintptr_t);
+            bool (*GetEstimatedPerformance)(ChromeMLPerformanceInfo*);
+            GenericFn QueryGPUAdapter;
+            GenericFn GetCapabilities;
+            void (*SetFatalErrorNonGpuFn)(FatalFn);
+          };
+          using Getter = const ChromeMLAPIPrefix* (*)(bool);
+
+          static void fatal(const char* s) { std::fprintf(stderr, "ChromeML fatal: %s\n", s ? s : "(null)"); }
+          static void m1(const char*, int, int) {}
+          static void m2(const char*, int, int, int, size_t) {}
+          static void m3(const char*, int64_t) {}
+
+          int main(int argc, char** argv) {
+            if (argc != 2) return 64;
+            void* lib = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+            if (!lib) { std::fprintf(stderr, "STAGE1_FAIL dlopen: %s\n", dlerror()); return 1; }
+            auto getter = reinterpret_cast<Getter>(dlsym(lib, "GetChromeMLAPI"));
+            if (!getter) { std::fprintf(stderr, "STAGE1_FAIL getter\n"); return 2; }
+            const ChromeMLAPIPrefix* api = getter(false);
+            if (!api) { std::fprintf(stderr, "STAGE1_FAIL legacy table null\n"); return 3; }
+
+            const DawnProcTable& procs = dawn::native::GetProcs();
+            if (!api->TryInitDawnProcs(procs)) {
+              std::fprintf(stderr, "STAGE1_FAIL exact Dawn proc table rejected\n");
+              return 4;
+            }
+            puts("STAGE1_DAWN_PASS exact Chrome 152 Dawn proc table accepted outside Chrome");
+
+            const ChromeMLMetricsFns metrics{&m1, &m2, &m3};
+            api->SetFatalErrorFn(&fatal);
+            api->SetFatalErrorNonGpuFn(&fatal);
+            api->SetMetricsFns(&metrics);
+
+            ChromeMLPerformanceInfo perf;
+            if (api->GetEstimatedPerformance(&perf)) {
+              std::printf("STAGE1_PERF_PASS input=%.3f output=%.3f integrated=%d heap=%llu max_buffer=%llu\n",
+                          perf.input_speed, perf.output_speed, perf.is_integrated_gpu ? 1 : 0,
+                          static_cast<unsigned long long>(perf.device_heap_size),
+                          static_cast<unsigned long long>(perf.max_buffer_size));
+            } else {
+              puts("STAGE1_PERF_UNAVAILABLE Dawn initialized, but hosted runner did not expose a usable performance probe");
+            }
+            dlclose(lib);
+            return 0;
+          }
+          EOF
+
+          cat >/tmp/chromeml-stage1/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.20)
+          project(chromeml_stage1 LANGUAGES CXX)
+          set(CMAKE_CXX_STANDARD 20)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          find_package(Threads REQUIRED)
+          find_package(Dawn REQUIRED CONFIG)
+          add_executable(chromeml_stage1 main.cpp)
+          target_link_libraries(chromeml_stage1 PRIVATE dawn::webgpu_dawn)
+          EOF
+
+          cmake -S /tmp/chromeml-stage1 -B /tmp/chromeml-stage1/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH=/tmp/dawn-install
+          cmake --build /tmp/chromeml-stage1/build --parallel 3
+
+      - name: Stage 1 — initialize ChromeML with exact Dawn outside Chrome
+        shell: bash
+        run: |
+          set -euxo pipefail
+          /tmp/chromeml-stage1/build/chromeml_stage1 /tmp/liboptimization_guide_internal.dylib | tee /tmp/chromeml-stage1-report.txt
+          grep -q 'STAGE1_DAWN_PASS' /tmp/chromeml-stage1-report.txt
