@@ -67,7 +67,11 @@ jobs:
         run: |
           set -euxo pipefail
           DAWN_REV=571752c9cb3ed36a3194854374984427794c4dda
-          git clone --depth 1 --branch chromium/7977 https://dawn.googlesource.com/dawn /tmp/dawn
+          mkdir /tmp/dawn
+          git -C /tmp/dawn init
+          git -C /tmp/dawn remote add origin https://dawn.googlesource.com/dawn
+          git -C /tmp/dawn fetch --depth 1 origin "$DAWN_REV"
+          git -C /tmp/dawn checkout --detach FETCH_HEAD
           test "$(git -C /tmp/dawn rev-parse HEAD)" = "$DAWN_REV"
           cmake --version
           ninja --version
@@ -144,7 +148,7 @@ jobs:
             if (!lib) { std::fprintf(stderr, "STAGE1_FAIL dlopen: %s\n", dlerror()); return 1; }
             auto getter = reinterpret_cast<Getter>(dlsym(lib, "GetChromeMLAPI"));
             if (!getter) { std::fprintf(stderr, "STAGE1_FAIL getter\n"); return 2; }
-            const ChromeMLAPIPrefix* api = getter(false);  // legacy ChromeML/Nano path first
+            const ChromeMLAPIPrefix* api = getter(false);
             if (!api) { std::fprintf(stderr, "STAGE1_FAIL legacy table null\n"); return 3; }
 
             const DawnProcTable& procs = dawn::native::GetProcs();
