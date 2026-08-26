@@ -1,0 +1,179 @@
+name: ChromeML model package probe
+
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    name: Inspect official Nano CRX by byte range
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Inspect package directory without full download
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import io, json, struct, urllib.request, zlib
+
+          URL = 'https://dl.google.com/release2/chrome_component/ac3uxiyzyouxrt63gkhye6luadna_2025.8.8.1141/fklghjjljmnfjoepjmlobpekiapffcja_2025.8.8.1141_all_ac2d3dn5lvjgqup4kcliqlhbxo3a.crx3'
+          TOTAL = 4269937721
+          EXPECTED_SHA = '882fb2e911f13e972e397ab2b8c7b3f78c0d767b7954d96a0efb61e62a09585e'
+
+          def fetch_range(start, end):
+              req = urllib.request.Request(URL, headers={'Range': f'bytes={start}-{end}', 'User-Agent':'Chrome/152.0.7977.65'})
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  data = r.read()
+                  print('RANGE', start, end, 'status', r.status, 'content-range', r.headers.get('Content-Range'), 'bytes', len(data))
+                  if r.status not in (200,206):
+                      raise RuntimeError(f'bad status {r.status}')
+                  return data
+
+          head = fetch_range(0, 65535)
+          if head[:4] != b'Cr24':
+              raise SystemExit(f'PACKAGE_FAIL bad CRX magic {head[:4]!r}')
+          version, header_size = struct.unpack_from('<II', head, 4)
+          if version != 3:
+              raise SystemExit(f'PACKAGE_FAIL CRX version {version}')
+          zip_start = 12 + header_size
+          print('CRX_VERSION=', version)
+          print('CRX_HEADER_SIZE=', header_size)
+          print('ZIP_START=', zip_start)
+          print('EXPECTED_CRX_SHA256=', EXPECTED_SHA)
+
+          tail_size = 4 * 1024 * 1024
+          tail_start = TOTAL - tail_size
+          tail = fetch_range(tail_start, TOTAL - 1)
+
+          # Locate classic EOCD.
+          eocd_sig = b'PK\x05\x06'
+          eocd_pos = tail.rfind(eocd_sig)
+          if eocd_pos < 0:
+              raise SystemExit('PACKAGE_FAIL EOCD not found in suffix')
+          eocd_abs = tail_start + eocd_pos
+          fields = struct.unpack_from('<4s4H2LH', tail, eocd_pos)
+          _, disk_no, cd_disk, disk_entries, total_entries16, cd_size32, cd_off32, comment_len = fields
+          print('EOCD_ABS=', eocd_abs, 'entries16=', total_entries16, 'cd_size32=', cd_size32, 'cd_off32=', cd_off32)
+
+          # Resolve Zip64 if necessary.
+          total_entries = total_entries16
+          cd_size = cd_size32
+          cd_off = cd_off32
+          if total_entries16 == 0xffff or cd_size32 == 0xffffffff or cd_off32 == 0xffffffff:
+              locator_sig = b'PK\x06\x07'
+              locator_pos = tail.rfind(locator_sig, 0, eocd_pos)
+              if locator_pos < 0:
+                  raise SystemExit('PACKAGE_FAIL Zip64 locator missing')
+              _, zip64_disk, zip64_eocd_off, total_disks = struct.unpack_from('<4sLQL', tail, locator_pos)
+              z64_abs = zip_start + zip64_eocd_off
+              if tail_start <= z64_abs < TOTAL:
+                  z64 = tail[z64_abs-tail_start:]
+              else:
+                  z64 = fetch_range(z64_abs, min(TOTAL-1, z64_abs+4095))
+              if z64[:4] != b'PK\x06\x06':
+                  raise SystemExit(f'PACKAGE_FAIL bad Zip64 EOCD signature at {z64_abs}')
+              # signature, record_size, made_by, needed, disk, cd_disk, entries_disk, entries_total, cd_size, cd_offset
+              vals = struct.unpack_from('<4sQ2H2L4Q', z64, 0)
+              total_entries = vals[7]
+              cd_size = vals[8]
+              cd_off = vals[9]
+              print('ZIP64_EOCD_ABS=', z64_abs, 'entries=', total_entries, 'cd_size=', cd_size, 'cd_off=', cd_off)
+
+          cd_abs = zip_start + cd_off
+          cd_end = cd_abs + cd_size - 1
+          if cd_size > 64 * 1024 * 1024:
+              raise SystemExit(f'PACKAGE_FAIL implausible central directory size {cd_size}')
+          if tail_start <= cd_abs and cd_end < TOTAL:
+              cd = tail[cd_abs-tail_start:cd_end-tail_start+1]
+          else:
+              cd = fetch_range(cd_abs, cd_end)
+
+          entries = []
+          p = 0
+          while p + 46 <= len(cd):
+              if cd[p:p+4] != b'PK\x01\x02':
+                  raise SystemExit(f'PACKAGE_FAIL bad central directory signature at {p}: {cd[p:p+4]!r}')
+              vals = struct.unpack_from('<4s6H3L5H2L', cd, p)
+              method = vals[4]
+              comp32 = vals[8]
+              uncomp32 = vals[9]
+              name_len, extra_len, comment_len = vals[10], vals[11], vals[12]
+              local_off32 = vals[16]
+              name = cd[p+46:p+46+name_len].decode('utf-8', 'replace')
+              extra = cd[p+46+name_len:p+46+name_len+extra_len]
+              comp, uncomp, local_off = comp32, uncomp32, local_off32
+              # Zip64 extended information field, values appear only for saturated fields in fixed order.
+              q = 0
+              while q + 4 <= len(extra):
+                  tag, sz = struct.unpack_from('<HH', extra, q)
+                  body = extra[q+4:q+4+sz]
+                  if tag == 0x0001:
+                      r = 0
+                      if uncomp32 == 0xffffffff:
+                          uncomp = struct.unpack_from('<Q', body, r)[0]; r += 8
+                      if comp32 == 0xffffffff:
+                          comp = struct.unpack_from('<Q', body, r)[0]; r += 8
+                      if local_off32 == 0xffffffff:
+                          local_off = struct.unpack_from('<Q', body, r)[0]; r += 8
+                      break
+                  q += 4 + sz
+              entries.append({'name':name,'method':method,'compressed':comp,'uncompressed':uncomp,'local_off':local_off})
+              p += 46 + name_len + extra_len + comment_len
+
+          print('ENTRY_COUNT=', len(entries))
+          for e in entries:
+              print('ENTRY', json.dumps(e, sort_keys=True))
+
+          def read_entry(e, max_uncompressed=4*1024*1024):
+              if e['uncompressed'] > max_uncompressed:
+                  return None
+              local_abs = zip_start + e['local_off']
+              local = fetch_range(local_abs, local_abs + 65535)
+              if local[:4] != b'PK\x03\x04':
+                  raise RuntimeError(f'bad local header for {e["name"]}')
+              name_len, extra_len = struct.unpack_from('<HH', local, 26)
+              data_abs = local_abs + 30 + name_len + extra_len
+              comp = fetch_range(data_abs, data_abs + e['compressed'] - 1) if e['compressed'] else b''
+              if e['method'] == 0:
+                  raw = comp
+              elif e['method'] == 8:
+                  raw = zlib.decompress(comp, -15)
+              else:
+                  print('SKIP_UNSUPPORTED_METHOD', e['name'], e['method'])
+                  return None
+              if len(raw) != e['uncompressed']:
+                  raise RuntimeError(f'size mismatch for {e["name"]}: {len(raw)} != {e["uncompressed"]}')
+              return raw
+
+          interesting = []
+          for e in entries:
+              low = e['name'].lower()
+              if e['uncompressed'] <= 4*1024*1024 and (low.endswith(('.json','.txt','.pb','.proto')) or 'manifest' in low or 'config' in low):
+                  interesting.append(e)
+          for e in interesting:
+              try:
+                  raw = read_entry(e)
+              except Exception as ex:
+                  print('ENTRY_READ_FAIL', e['name'], repr(ex))
+                  continue
+              if raw is None:
+                  continue
+              print('SMALL_FILE_BEGIN', e['name'], 'bytes=', len(raw))
+              try:
+                  text = raw.decode('utf-8')
+                  print(text[:200000])
+              except UnicodeDecodeError:
+                  print('HEX_PREFIX', raw[:512].hex())
+              print('SMALL_FILE_END', e['name'])
+
+          weights = [e for e in entries if e['name'].lower().endswith('weights.bin')]
+          print('WEIGHTS_ENTRIES=', json.dumps(weights, sort_keys=True))
+          if not weights:
+              print('PACKAGE_NOTE no literal weights.bin entry; inspect entry list above for model payload')
+          print('PACKAGE_PASS official Nano CRX structure inspected without full download')
+          PY
