@@ -1,0 +1,84 @@
+name: ChromeML standalone probe
+
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stage0:
+    name: Stage 0 — dlopen + API getter
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Download current stable Google Chrome
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl --fail --location --retry 3 \
+            'https://dl.google.com/chrome/mac/universal/stable/GGRO/googlechrome.dmg' \
+            --output /tmp/googlechrome.dmg
+          hdiutil attach -nobrowse -readonly /tmp/googlechrome.dmg -mountpoint /tmp/chrome-dmg
+          LIB="$(find '/tmp/chrome-dmg/Google Chrome.app' -name liboptimization_guide_internal.dylib -print -quit)"
+          test -n "$LIB"
+          cp "$LIB" /tmp/liboptimization_guide_internal.dylib
+          '/tmp/chrome-dmg/Google Chrome.app/Contents/MacOS/Google Chrome' --version || true
+          file /tmp/liboptimization_guide_internal.dylib
+          shasum -a 256 /tmp/liboptimization_guide_internal.dylib
+          otool -L /tmp/liboptimization_guide_internal.dylib
+          nm -gU /tmp/liboptimization_guide_internal.dylib | grep -E 'GetChromeMLAPI|GetPageContextEligibilityAPI'
+
+      - name: Build standalone getter probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat >/tmp/chromeml_stage0.c <<'EOF'
+          #include <dlfcn.h>
+          #include <stdbool.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+
+          typedef const void* (*ChromeMLAPIGetter)(bool enable_litert_lm);
+
+          int main(int argc, char** argv) {
+            if (argc != 2) {
+              fprintf(stderr, "usage: %s /path/to/liboptimization_guide_internal.dylib\n", argv[0]);
+              return 64;
+            }
+            void* lib = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+            if (!lib) {
+              fprintf(stderr, "STAGE0_FAIL dlopen: %s\n", dlerror());
+              return 1;
+            }
+            dlerror();
+            ChromeMLAPIGetter getter = (ChromeMLAPIGetter)dlsym(lib, "GetChromeMLAPI");
+            const char* err = dlerror();
+            if (err || !getter) {
+              fprintf(stderr, "STAGE0_FAIL dlsym: %s\n", err ? err : "null symbol");
+              return 2;
+            }
+            const void* legacy = getter(false);
+            const void* litert = getter(true);
+            printf("legacy_api=%p\n", legacy);
+            printf("litert_api=%p\n", litert);
+            if (!legacy && !litert) {
+              fprintf(stderr, "STAGE0_FAIL both API tables null\n");
+              return 3;
+            }
+            puts("STAGE0_PASS ChromeML loaded and API table returned outside Chrome");
+            dlclose(lib);
+            return 0;
+          }
+          EOF
+          xcrun clang -O2 -Wall -Wextra /tmp/chromeml_stage0.c -o /tmp/chromeml_stage0
+          file /tmp/chromeml_stage0
+
+      - name: Execute ChromeML outside Chrome
+        shell: bash
+        run: |
+          set -euxo pipefail
+          /tmp/chromeml_stage0 /tmp/liboptimization_guide_internal.dylib | tee /tmp/chromeml-stage0-report.txt
+          grep -q 'STAGE0_PASS' /tmp/chromeml-stage0-report.txt
