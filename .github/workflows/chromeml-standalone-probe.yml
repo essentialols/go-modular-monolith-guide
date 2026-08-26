@@ -62,7 +62,15 @@ jobs:
           xcrun clang -O2 -Wall -Wextra /tmp/chromeml_stage0.c -o /tmp/chromeml_stage0
           /tmp/chromeml_stage0 /tmp/liboptimization_guide_internal.dylib
 
+      - name: Restore exact Dawn build
+        id: dawn-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/dawn-install
+          key: chromeml-dawn-571752c9cb3ed36a3194854374984427794c4dda-macos15-arm64-v1
+
       - name: Fetch exact Chrome 152 Dawn revision
+        if: steps.dawn-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -euxo pipefail
@@ -77,6 +85,7 @@ jobs:
           ninja --version
 
       - name: Build and install exact Dawn
+        if: steps.dawn-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -euxo pipefail
@@ -102,7 +111,6 @@ jobs:
           #include <cstdint>
           #include <cstdio>
 
-          #include <dawn/dawn_proc.h>
           #include <dawn/dawn_proc_table.h>
           #include <dawn/native/DawnNative.h>
 
@@ -152,7 +160,6 @@ jobs:
             if (!api) { std::fprintf(stderr, "STAGE1_FAIL legacy table null\n"); return 3; }
 
             const DawnProcTable& procs = dawn::native::GetProcs();
-            dawnProcSetProcs(&procs);
             if (!api->TryInitDawnProcs(procs)) {
               std::fprintf(stderr, "STAGE1_FAIL exact Dawn proc table rejected\n");
               return 4;
